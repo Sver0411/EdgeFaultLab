@@ -15,10 +15,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .assertions import AssertionResult
-from .matcher import matches
+from .assertions import (
+    AssertionResult,
+    observation_in_window,
+    observation_matches,
+    observation_selected,
+)
 from .recorder import EventRecorder, SUMMARY_COUNTERS
-from .scenario import AssertionSpec, Scenario
+from .scenario import AssertionSpec, FaultSpec, Scenario, default_description
 
 __all__ = [
     "build_report_markdown",
@@ -26,6 +30,7 @@ __all__ = [
     "compute_recovery",
     "CONSOLE_EVENTS",
     "describe_event",
+    "find_disruptions",
     "format_event",
     "render_console",
     "render_header",
@@ -180,44 +185,96 @@ def render_header(scenario: Scenario, seed: int, version: str) -> str:
     )
 
 
+#: Which event marks the moment a fault actually hurt the system.
+_DISRUPTION_EVENTS = {
+    "drop": "MESSAGE_DROPPED",
+    "disconnect": "LINK_DISCONNECTED",
+    "link_down": "LINK_DOWN",
+    "process_kill": "PROCESS_KILL",
+}
+
+
+def find_disruptions(
+    recorder: EventRecorder, faults: tuple[FaultSpec, ...]
+) -> list[dict[str, Any]]:
+    """When each disruptive fault actually took effect.
+
+    ``FAULT_ACTIVATED`` is only when a fault became armed.  A drop with
+    ``"probability": 0.3`` may be armed at 5s and not remove a message until 9s,
+    so the clock starts at ``MESSAGE_DROPPED``.  A fault that never took effect
+    (the message it waited for never came) contributes nothing at all.
+    """
+    disruptions = []
+    for fault in faults:
+        event = _DISRUPTION_EVENTS.get(fault.action)
+        if event is None:
+            continue
+        # Same default id the fault engine uses for a hand-built FaultSpec.
+        fault_id = fault.fault_id or f"{fault.action}#{fault.index + 1}"
+        for record in recorder.events:
+            if record["event"] != event:
+                continue
+            details = record.get("details", {})
+            if details.get("fault_id") != fault_id:
+                continue
+            disruptions.append(
+                {
+                    "fault": fault_id,
+                    "action": fault.action,
+                    "event": event,
+                    "at": record["time"],
+                }
+            )
+            break
+    return disruptions
+
+
 def compute_recovery(
     recorder: EventRecorder,
-    disruptions: list[tuple[str, float]],
+    disruptions: list[dict[str, Any]],
     assertions: tuple[AssertionSpec, ...],
 ) -> list[dict[str, Any]]:
-    """Time from each disruptive fault to the system's first sign of life.
+    """Time from a real disruption to the system's first sign of life after it.
 
-    Recovery is measured against the ``eventually`` assertions of the scenario:
-    "the fault fired at 10.0s, and the promised message showed up at 18.2s, so
-    recovery took 8.2s".  A scenario without ``eventually`` assertions falls back
-    to the first message delivered after the fault.
+    The recovery signal is the first delivery that satisfies one of the
+    scenario's ``eventually`` assertions - using the *same* link, direction,
+    match filter and time window as that assertion, so the assertion and the
+    metric can never disagree.  A scenario without ``eventually`` assertions
+    falls back to the first message delivered after the disruption.
     """
     eventually = [spec for spec in assertions if spec.kind == "eventually"]
     report = []
-    for fault_id, activated_at in disruptions:
+    for disruption in disruptions:
+        disrupted_at = disruption["at"]
         recovered_at: float | None = None
         recovered_by: str | None = None
         for observation in recorder.observations:
-            if observation["time"] <= activated_at:
+            if observation["time"] <= disrupted_at:
                 continue
             if eventually:
                 for spec in eventually:
-                    if matches(observation.get("message"), spec.match):
+                    if (
+                        observation_selected(spec, observation)
+                        and observation_in_window(spec, observation["time"])
+                        and observation_matches(spec, observation)
+                    ):
                         recovered_at = observation["time"]
-                        recovered_by = spec.description or f"assertions[{spec.index}]"
+                        recovered_by = spec.description or default_description(spec)
                         break
             else:
                 recovered_at = observation["time"]
-                recovered_by = "first message delivered after the fault"
+                recovered_by = "first message delivered after the disruption"
             if recovered_at is not None:
                 break
         report.append(
             {
-                "fault": fault_id,
-                "activated_at": round(activated_at, 6),
+                "fault": disruption["fault"],
+                "action": disruption["action"],
+                "disruption_event": disruption["event"],
+                "disrupted_at": round(disrupted_at, 6),
                 "recovered_at": None if recovered_at is None else round(recovered_at, 6),
                 "recovery_time": (
-                    None if recovered_at is None else round(recovered_at - activated_at, 6)
+                    None if recovered_at is None else round(recovered_at - disrupted_at, 6)
                 ),
                 "recovered_by": recovered_by,
             }
@@ -342,13 +399,16 @@ def build_report_markdown(
         for entry in entries:
             lines.append(
                 f"- {entry['fault']}: {entry['recovery_time']:.3f}s "
-                f"(fault at {entry['activated_at']:.3f}s, recovered at "
+                f"(disrupted at {entry['disrupted_at']:.3f}s by "
+                f"{entry['disruption_event']}, recovered at "
                 f"{entry['recovered_at']:.3f}s via {entry['recovered_by']})"
             )
         lines.append("")
         lines.append(f"Recovery time: {entries[0]['recovery_time']:.3f} s")
     else:
-        lines.append("Recovery time: n/a (no disruptive fault, or nothing recovered)")
+        lines.append(
+            "Recovery time: n/a (no disruptive fault took effect, or nothing recovered)"
+        )
 
     lines += ["", "## Assertions", ""]
     if results:

@@ -30,6 +30,7 @@ from .report import (
     build_report_markdown,
     build_summary,
     compute_recovery,
+    find_disruptions,
     render_console,
     write_report,
     write_summary,
@@ -111,9 +112,13 @@ class ScenarioRunner:
         )
         try:
             self.engine.start()
-            await self.processes.start_all()
+            # Links listen first: a node that connects the instant it starts
+            # must find EdgeFaultLab already there, or the test tool itself
+            # becomes the fault. Only a real client connection needs the
+            # upstream, and that happens later.
             for proxy in self.proxies.values():
                 await proxy.start()
+            await self.processes.start_all()
             started_ok = True
             timers = [
                 asyncio.create_task(self._run_timed_fault(fault))
@@ -141,11 +146,7 @@ class ScenarioRunner:
                 },
             )
         self.recorder.event("RUN_FINISHED", details={"failures": len(self.failures)})
-        disruptions = [
-            (fault.id, fault.activated_at)
-            for fault in self.engine.faults
-            if fault.spec.is_disruptive and fault.activated_at is not None
-        ]
+        disruptions = find_disruptions(self.recorder, self.scenario.faults)
         recovery = compute_recovery(self.recorder, disruptions, self.scenario.assertions)
         exit_code = self._exit_code(results)
         summary = build_summary(
@@ -216,17 +217,17 @@ class ScenarioRunner:
             fault.activate()
             if spec.action == "disconnect":
                 proxy = self.proxies[spec.link]
-                await proxy.disconnect(f"fault {fault.id}")
+                await proxy.disconnect(f"fault {fault.id}", fault_id=fault.id)
                 fault.complete("connections dropped")
             elif spec.action == "link_down":
                 proxy = self.proxies[spec.link]
-                await proxy.set_down(True, f"fault {fault.id}")
+                await proxy.set_down(True, f"fault {fault.id}", fault_id=fault.id)
                 await self._sleep_until(spec.at + spec.link_down_seconds)
                 if not self.stop_event.is_set():
                     await proxy.set_down(False, f"fault {fault.id}")
                     fault.complete("link restored")
             elif spec.action == "process_kill":
-                await self.processes.kill(spec.process)
+                await self.processes.kill(spec.process, fault_id=fault.id)
                 fault.complete("process terminated")
             elif spec.action == "process_restart":
                 await self.processes.restart(spec.process)

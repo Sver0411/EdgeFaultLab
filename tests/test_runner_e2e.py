@@ -7,11 +7,16 @@ against what the proxy actually delivered.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 
+from edgefaultlab.runner import ScenarioRunner
+from edgefaultlab.scenario import load_scenario
 from tests.conftest import (
+    Collector,
     DEMO_SYSTEM,
+    free_port,
     free_ports,
     read_events,
     run_scenario_file,
@@ -186,3 +191,55 @@ def test_link_down_is_survived_and_the_fault_is_recorded(tmp_path):
     summary = json.loads((output / "summary.json").read_text())
     assert summary["messages_dropped"] == 0
     assert summary["recovery_time"] is not None
+
+
+#: Connects to the proxy port the instant the process starts - no retry, no
+#: sleep.  If the proxy is not listening yet, this raises and the run fails.
+CONNECT_IMMEDIATELY = (
+    "import json, socket, sys\n"
+    "sock = socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=3)\n"
+    "sock.sendall(json.dumps({'type': 'HELLO', 'message_id': 'startup'}).encode() + b'\\n')\n"
+    "sock.close()\n"
+)
+
+
+def test_proxies_listen_before_child_processes_start(tmp_path):
+    async def scenario():
+        listen, upstream = free_port(), free_port()
+        collector = Collector()
+        await collector.start(upstream)
+        data = {
+            "name": "startup order",
+            "seed": 1,
+            "duration": 3,
+            "links": [
+                {
+                    "name": "l",
+                    "listen": f"127.0.0.1:{listen}",
+                    "upstream": f"127.0.0.1:{upstream}",
+                }
+            ],
+            "processes": [
+                {
+                    "name": "connector",
+                    "command": [sys.executable, "-c", CONNECT_IMMEDIATELY, str(listen)],
+                }
+            ],
+            "faults": [],
+            "assertions": [],
+        }
+        runner = ScenarioRunner(
+            load_scenario(write_scenario(tmp_path, data)), output=tmp_path / "run"
+        )
+        exit_code = await runner.run()
+        await collector.stop()
+        return exit_code, runner, collector
+
+    exit_code, runner, collector = asyncio.run(scenario())
+
+    assert exit_code == 0
+    assert [message["message_id"] for message in collector.received] == ["startup"]
+    assert runner.summary["processes"][0]["exit_code"] == 0, (
+        "the child connected without having to retry - EdgeFaultLab did not make it wait"
+    )
+    assert runner.summary["processes"][0]["pid"] is not None

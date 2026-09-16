@@ -10,10 +10,12 @@ from edgefaultlab.report import (
     build_report_markdown,
     build_summary,
     compute_recovery,
+    find_disruptions,
     render_console,
     write_summary,
 )
 from edgefaultlab.scenario import AssertionSpec, Scenario
+from tests.conftest import make_fault
 
 
 def scenario() -> Scenario:
@@ -29,9 +31,18 @@ def recorder_with_fault() -> EventRecorder:
         at=5.0,
         details={"fault_id": "kill#1", "action": "process_kill", "disruptive": True},
     )
+    recorder.event(
+        "PROCESS_KILL",
+        at=5.0,
+        details={"process": "relay", "pid": 12, "signal": "terminate", "fault_id": "kill#1"},
+    )
     recorder.observe({"type": "HEARTBEAT"}, link="l", direction="forward", at=8.5)
     recorder.event("MESSAGE_FORWARDED", link="l", message={"type": "HEARTBEAT", "message_id": "m2"})
     return recorder
+
+
+def kill_fault():
+    return make_fault(0, "process_kill", at=5.0, process="relay", fault_id="kill#1")
 
 
 def test_summary_contains_the_documented_counters(tmp_path):
@@ -75,13 +86,98 @@ def test_summary_contains_the_documented_counters(tmp_path):
 def test_recovery_time_is_measured_from_the_fault_to_the_promise():
     recorder = recorder_with_fault()
     spec = AssertionSpec(0, "eventually", match={"type": "HEARTBEAT"}, after=0, within=10)
-    recovery = compute_recovery(recorder, [("kill#1", 5.0)], (spec,))
+    disruptions = find_disruptions(recorder, (kill_fault(),))
+    assert disruptions[0]["event"] == "PROCESS_KILL"
+    assert disruptions[0]["at"] == 5.0, "the clock starts when the kill took effect"
+
+    recovery = compute_recovery(recorder, disruptions, (spec,))
     assert recovery[0]["recovery_time"] == 3.5
     assert recovery[0]["recovered_at"] == 8.5
 
     assert compute_recovery(recorder, [], (spec,)) == []
-    stuck = compute_recovery(recorder, [("kill#1", 9.0)], (spec,))
+    stuck = compute_recovery(recorder, [dict(disruptions[0], at=9.0)], (spec,))
     assert stuck[0]["recovery_time"] is None
+
+
+def test_recovery_starts_when_the_fault_actually_bit():
+    """An armed fault that has not done anything yet is not a disruption."""
+    recorder = EventRecorder()
+    recorder.event(
+        "FAULT_ACTIVATED",
+        link="l",
+        at=5.0,
+        details={"fault_id": "drop#1", "action": "drop", "disruptive": True},
+    )
+    recorder.event(
+        "MESSAGE_DROPPED",
+        link="l",
+        at=8.0,
+        message={"type": "CMD", "message_id": "m1"},
+        details={"fault_id": "drop#1"},
+    )
+    recorder.observe({"type": "HEARTBEAT"}, link="l", direction="forward", at=10.0)
+
+    fault = make_fault(0, "drop", at=5.0, link="l", match={"type": "CMD"}, fault_id="drop#1")
+    disruptions = find_disruptions(recorder, (fault,))
+    assert disruptions[0]["at"] == 8.0
+    assert disruptions[0]["event"] == "MESSAGE_DROPPED"
+
+    spec = AssertionSpec(0, "eventually", match={"type": "HEARTBEAT"}, after=0, within=30)
+    recovery = compute_recovery(recorder, disruptions, (spec,))
+    assert recovery[0]["recovery_time"] == 2.0, "not 5.0s, which would count armed time"
+    assert recovery[0]["disrupted_at"] == 8.0
+
+    # A fault that never took effect has no recovery time at all.
+    recorder2 = EventRecorder()
+    recorder2.event(
+        "FAULT_ACTIVATED", link="l", at=5.0, details={"fault_id": "drop#1", "action": "drop"}
+    )
+    assert find_disruptions(recorder2, (fault,)) == []
+
+
+def test_recovery_uses_the_same_selector_and_window_as_the_assertion():
+    recorder = EventRecorder()
+    recorder.event(
+        "LINK_DOWN",
+        link="link_a",
+        at=5.0,
+        details={"fault_id": "down#1", "action": "link_down", "reason": "fault down#1"},
+    )
+    # Same message type, wrong link, then wrong direction, then the real one.
+    recorder.observe({"type": "HEARTBEAT"}, link="link_b", direction="forward", at=6.0)
+    recorder.observe({"type": "HEARTBEAT"}, link="link_a", direction="reverse", at=7.0)
+    recorder.observe({"type": "HEARTBEAT"}, link="link_a", direction="forward", at=9.0)
+
+    fault = make_fault(1, "link_down", at=5.0, link="link_a", fault_id="down#1")
+    disruptions = find_disruptions(recorder, (fault,))
+    assert disruptions[0]["at"] == 5.0
+
+    spec = AssertionSpec(
+        0,
+        "eventually",
+        match={"type": "HEARTBEAT"},
+        after=0,
+        within=8,  # the recovery at 9.0s is outside this window
+        link="link_a",
+        direction="forward",
+    )
+    recovery = compute_recovery(recorder, disruptions, (spec,))
+    assert recovery[0]["recovered_at"] is None, "the window applies to recovery too"
+    assert recovery[0]["recovery_time"] is None
+
+    wider = AssertionSpec(
+        0,
+        "eventually",
+        match={"type": "HEARTBEAT"},
+        after=0,
+        within=20,
+        link="link_a",
+        direction="forward",
+    )
+    recovery = compute_recovery(recorder, disruptions, (wider,))
+    assert recovery[0]["recovered_at"] == 9.0
+    assert recovery[0]["recovery_time"] == 4.0
+    assert "on link_a (forward)" in recovery[0]["recovered_by"]
 
 
 def test_report_and_console_are_short_and_state_the_result():
@@ -92,7 +188,7 @@ def test_report_and_console_are_short_and_state_the_result():
         3,
         recorder,
         results,
-        compute_recovery(recorder, [("kill#1", 5.0)], ()),
+        compute_recovery(recorder, find_disruptions(recorder, (kill_fault(),)), ()),
         run_id="run-1",
         exit_code=0,
         failures=[],

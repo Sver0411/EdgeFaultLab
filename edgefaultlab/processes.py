@@ -17,7 +17,9 @@ import os
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 from .recorder import EventRecorder
 from .scenario import ProcessSpec
@@ -34,6 +36,22 @@ class ProcessError(Exception):
     """A process fault that could not be carried out (never swallowed)."""
 
 
+@dataclass
+class _Incarnation:
+    """One run of one process: the only state a watcher is allowed to touch.
+
+    A restart replaces ``ManagedProcess.current`` with a new incarnation.  The
+    watcher of the old one keeps working on *its own* record, so it can never
+    report the new PID or close the new log handle.
+    """
+
+    proc: asyncio.subprocess.Process
+    pid: int
+    log: IO[bytes] | None = None
+    expected_stop: bool = False
+    exit_code: int | None = None
+
+
 class ManagedProcess:
     """One scenario-declared process plus its current OS state."""
 
@@ -41,17 +59,34 @@ class ManagedProcess:
         self.spec = spec
         self.recorder = recorder
         self.log_path = log_path
-        self.proc: asyncio.subprocess.Process | None = None
-        self.pid: int | None = None
+        self.current: _Incarnation | None = None
         self.restarts = 0
-        self.exit_code: int | None = None
-        self.expected_stop = False
-        self._log = None
         self._watcher: asyncio.Task | None = None
 
     @property
     def name(self) -> str:
         return self.spec.name
+
+    @property
+    def proc(self) -> asyncio.subprocess.Process | None:
+        return self.current.proc if self.current is not None else None
+
+    @property
+    def pid(self) -> int | None:
+        return self.current.pid if self.current is not None else None
+
+    @property
+    def exit_code(self) -> int | None:
+        return self.current.exit_code if self.current is not None else None
+
+    @property
+    def expected_stop(self) -> bool:
+        return self.current.expected_stop if self.current is not None else False
+
+    @expected_stop.setter
+    def expected_stop(self, value: bool) -> None:
+        if self.current is not None:
+            self.current.expected_stop = value
 
     @property
     def is_running(self) -> bool:
@@ -111,7 +146,7 @@ class ProcessManager:
         env = dict(os.environ)
         env.update(managed.spec.env)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        managed._log = managed.log_path.open("ab")
+        log = managed.log_path.open("ab")
 
         kwargs: dict = {}
         if _IS_WINDOWS:  # pragma: no cover - platform dependent
@@ -120,58 +155,65 @@ class ProcessManager:
             kwargs["start_new_session"] = True
 
         try:
-            managed.proc = await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 *managed.spec.command,
                 cwd=managed.spec.cwd,
                 env=env,
                 stdin=asyncio.subprocess.DEVNULL,
-                stdout=managed._log,
+                stdout=log,
                 stderr=asyncio.subprocess.STDOUT,
                 **kwargs,
             )
         except OSError as exc:
-            managed._log.close()
-            managed._log = None
+            log.close()
             raise ProcessError(
                 f"process {name!r} failed to start: {exc.strerror or exc} "
                 f"(command {managed.spec.command[0]!r}, cwd {managed.spec.cwd!r})"
             ) from exc
 
-        managed.pid = managed.proc.pid
-        managed.expected_stop = False
-        managed.exit_code = None
-        managed._watcher = asyncio.create_task(self._watch(managed))
+        incarnation = _Incarnation(proc=proc, pid=proc.pid, log=log)
+        managed.current = incarnation
+        managed._watcher = asyncio.create_task(self._watch(managed, incarnation))
         self.recorder.event(
             "PROCESS_START",
             details={
                 "process": name,
-                "pid": managed.pid,
+                "pid": incarnation.pid,
                 "command": list(managed.spec.command),
                 "cwd": managed.spec.cwd,
             },
         )
         return managed
 
-    async def _watch(self, managed: ManagedProcess) -> None:
-        proc = managed.proc
-        if proc is None:  # pragma: no cover - defensive
-            return
-        returncode = await proc.wait()
-        managed.exit_code = returncode
+    async def _watch(self, managed: ManagedProcess, incarnation: _Incarnation) -> None:
+        """Report the exit of one incarnation, and only of that incarnation.
+
+        Everything this needs is captured when the process is started.  Reading
+        ``managed.pid`` or ``managed.current`` after the process has exited would
+        race with a restart that is already running the next incarnation.
+        """
+        returncode = await incarnation.proc.wait()
+        incarnation.exit_code = returncode
         self.recorder.event(
             "PROCESS_EXIT",
             details={
                 "process": managed.name,
-                "pid": managed.pid,
+                "pid": incarnation.pid,
                 "exit_code": returncode,
-                "expected": managed.expected_stop,
+                "expected": incarnation.expected_stop,
             },
         )
-        if managed._log is not None:
-            managed._log.close()
-            managed._log = None
+        if incarnation.log is not None:
+            incarnation.log.close()
 
-    async def kill(self, name: str) -> None:
+    async def _await_watcher(self, managed: ManagedProcess) -> None:
+        """Let the watcher of the current incarnation finish before moving on."""
+        watcher = managed._watcher
+        if watcher is None or watcher.done():
+            return
+        await asyncio.gather(watcher, return_exceptions=True)
+
+    async def kill(self, name: str, fault_id: str | None = None) -> None:
         """Terminate a managed process because a scenario asked for it."""
         managed = self.get(name)
         if not managed.is_running:
@@ -185,17 +227,28 @@ class ProcessManager:
             )
         self.recorder.event(
             "PROCESS_KILL",
-            details={"process": name, "pid": managed.pid, "signal": "terminate"},
+            details={
+                "process": name,
+                "pid": managed.pid,
+                "signal": "terminate",
+                "fault_id": fault_id,
+            },
         )
         await self._terminate(managed)
+        await self._await_watcher(managed)
 
     async def restart(self, name: str) -> None:
-        """Stop (if needed) and start a process again, recording both PIDs."""
+        """Stop (if needed) and start a process again, recording both PIDs.
+
+        The old incarnation is fully reaped - process exited, exit reported -
+        before the new one starts, so the two never overlap in the event trace.
+        """
         managed = self.get(name)
         old_pid = managed.pid
         if managed.is_running:
             managed.expected_stop = True
             await self._terminate(managed)
+        await self._await_watcher(managed)
         await self.start(name)
         managed.restarts += 1
         self.recorder.event(
@@ -219,18 +272,20 @@ class ProcessManager:
                 details={"process": managed.name, "pid": managed.pid, "reason": "run finished"},
             )
             await self._terminate(managed)
+            await self._await_watcher(managed)
 
     async def _terminate(self, managed: ManagedProcess) -> None:
-        proc = managed.proc
-        if proc is None or proc.returncode is not None:
+        incarnation = managed.current
+        if incarnation is None or incarnation.proc.returncode is not None:
             return
+        proc = incarnation.proc
         self._signal(proc, managed)
         try:
             await asyncio.wait_for(proc.wait(), timeout=TERMINATE_GRACE_SECONDS)
         except asyncio.TimeoutError:
             self.recorder.event(
                 "PROCESS_KILL_FORCED",
-                details={"process": managed.name, "pid": managed.pid, "signal": "kill"},
+                details={"process": managed.name, "pid": incarnation.pid, "signal": "kill"},
             )
             try:
                 proc.kill()

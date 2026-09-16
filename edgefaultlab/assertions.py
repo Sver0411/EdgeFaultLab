@@ -10,6 +10,10 @@ here::
     unique          a key (``payload.command_id``) must not appear twice
     sequence        filters must be satisfied in order
 
+``unique`` is deliberately unforgiving: a message that matches the filter but
+does not carry the key fails the assertion.  "I could not check" is not the same
+answer as "I checked, and it is fine".
+
 Assertions run over :attr:`EventRecorder.observations` - the messages that
 actually reached the far side of a link.  A dropped message was never observed,
 so it cannot satisfy an assertion, and a delayed message counts when it arrives.
@@ -31,7 +35,15 @@ from typing import Any
 from .matcher import MISSING, describe, get_field, matches
 from .scenario import AssertionSpec, default_description
 
-__all__ = ["AssertionResult", "evaluate_assertions", "describe_observation"]
+__all__ = [
+    "AssertionResult",
+    "describe_observation",
+    "evaluate_assertions",
+    "observation_in_window",
+    "observation_matches",
+    "observation_selected",
+    "select_observations",
+]
 
 
 @dataclass
@@ -85,20 +97,40 @@ def evaluate_assertions(
 # ---------------------------------------------------------------------------
 
 
-def _select(spec: AssertionSpec, observations: list[dict[str, Any]]) -> list[dict]:
-    """Keep only the deliveries the assertion asked about."""
-    if spec.link is None and spec.direction is None:
-        return observations
-    return [
-        obs
-        for obs in observations
-        if (spec.link is None or obs.get("link") == spec.link)
-        and (spec.direction is None or obs.get("direction") == spec.direction)
-    ]
+def select_observations(
+    spec: AssertionSpec, observations: list[dict[str, Any]]
+) -> list[dict]:
+    """Keep only the deliveries an assertion asked about (link and direction).
+
+    Public because the recovery metric uses the same selection: an assertion and
+    the recovery time derived from it must never drift apart.
+    """
+    return [obs for obs in observations if observation_selected(spec, obs)]
+
+
+def observation_selected(spec: AssertionSpec, observation: dict[str, Any]) -> bool:
+    """Does this delivery sit on the link and direction the assertion watches?"""
+    if spec.link is not None and observation.get("link") != spec.link:
+        return False
+    if spec.direction is not None and observation.get("direction") != spec.direction:
+        return False
+    return True
+
+
+def observation_matches(spec: AssertionSpec, observation: dict[str, Any]) -> bool:
+    """Does one observed delivery satisfy the assertion's ``match`` filter?"""
+    return matches(observation.get("message"), spec.match)
+
+
+def observation_in_window(spec: AssertionSpec, time: float) -> bool:
+    """Is ``time`` inside the window an ``eventually`` assertion watches?"""
+    if spec.within is None:
+        return True
+    return spec.after <= time <= spec.after + spec.within
 
 
 def _matching(spec: AssertionSpec, observations: list[dict[str, Any]]) -> list[dict]:
-    return [obs for obs in _select(spec, observations) if matches(obs.get("message"), spec.match)]
+    return [obs for obs in select_observations(spec, observations) if observation_matches(spec, obs)]
 
 
 def _check_message_count(
@@ -136,10 +168,12 @@ def _check_eventually(
     assert spec.within is not None
     deadline = spec.after + spec.within
     window = [
-        obs for obs in _select(spec, observations) if spec.after <= obs["time"] <= deadline
+        obs
+        for obs in select_observations(spec, observations)
+        if observation_in_window(spec, obs["time"])
     ]
     for observation in window:
-        if matches(observation.get("message"), spec.match):
+        if observation_matches(spec, observation):
             return True, (
                 f"matched [{describe(spec.match)}] at {observation['time']:.3f}s "
                 f"(window {spec.after:.3f}s..{deadline:.3f}s)"
@@ -154,12 +188,17 @@ def _check_eventually(
 def _check_unique(spec: AssertionSpec, observations: list[dict[str, Any]]) -> tuple[bool, str]:
     assert spec.key is not None
     seen: dict[Any, dict] = {}
-    missing = 0
-    for observation in _matching(spec, observations):
+    matched = _matching(spec, observations)
+    missing = [obs for obs in matched if get_field(obs.get("message"), spec.key) is MISSING]
+    if missing:
+        # A message without the key proves nothing about idempotency, so the
+        # assertion cannot pass: silence is not evidence.
+        return False, (
+            f"{len(missing)} matching message(s) missing key {spec.key}; first at "
+            f"{describe_observation(missing[0])}"
+        )
+    for observation in matched:
         value = get_field(observation.get("message"), spec.key)
-        if value is MISSING:
-            missing += 1
-            continue
         key = value if isinstance(value, (str, int, float, bool)) or value is None else repr(value)
         if key in seen:
             return False, (
@@ -167,15 +206,12 @@ def _check_unique(spec: AssertionSpec, observations: list[dict[str, Any]]) -> tu
                 f"{describe_observation(seen[key])} and {describe_observation(observation)}"
             )
         seen[key] = observation
-    detail = f"{len(seen)} distinct {spec.key} value(s)"
-    if missing:
-        detail += f"; {missing} matching message(s) had no {spec.key}"
-    return True, detail
+    return True, f"{len(seen)} distinct {spec.key} value(s) in {len(matched)} matching message(s)"
 
 
 def _check_sequence(spec: AssertionSpec, observations: list[dict[str, Any]]) -> tuple[bool, str]:
     step_index = 0
-    for observation in _select(spec, observations):
+    for observation in select_observations(spec, observations):
         if step_index >= len(spec.steps):
             break
         if matches(observation.get("message"), spec.steps[step_index]):

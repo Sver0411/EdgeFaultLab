@@ -21,6 +21,7 @@ message that names the offending field.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -226,12 +227,23 @@ def load_scenario(path: str | os.PathLike[str]) -> Scenario:
     except OSError as exc:
         raise ScenarioError(f"cannot read scenario file: {exc.strerror or exc}") from exc
     try:
-        data = json.loads(raw)
+        data = json.loads(raw, parse_constant=_reject_non_finite_literal)
     except json.JSONDecodeError as exc:
         raise ScenarioError(
             f"not valid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})"
         ) from exc
+    except ValueError as exc:
+        raise ScenarioError(f"not valid JSON: {exc}") from exc
     return _parse_scenario(data, str(scenario_path), str(scenario_path.resolve().parent))
+
+
+def _reject_non_finite_literal(name: str) -> float:
+    """``json.loads`` hook: ``NaN`` / ``Infinity`` / ``-Infinity`` are not JSON.
+
+    Python accepts them by default, which would let a scenario carry a value
+    that no other JSON tool can read and that no timing code can act on.
+    """
+    raise ValueError(f"{name} is not a finite number (NaN and Infinity are not allowed)")
 
 
 def parse_address(value: Any, label: str, errors: list[str]) -> tuple[str, int] | None:
@@ -262,7 +274,19 @@ def parse_address(value: Any, label: str, errors: list[str]) -> tuple[str, int] 
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """True for a finite int/float - never for ``bool``, ``NaN`` or ``inf``.
+
+    Every timing field in a scenario (``duration``, ``at``, ``probability``,
+    ``delay_ms``, ``offset_ms``, a ``link_down`` duration, ``after``, ``within``)
+    goes through here, because a non-finite number would reach ``asyncio.sleep``
+    and turn into a run that never ends or never starts.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):  # a huge int that has no float form
+        return False
 
 
 def _check_unknown_keys(where: str, data: dict, allowed: set[str], errors: list[str]) -> None:
@@ -384,6 +408,53 @@ def _parse_processes(
         if name and argv:
             processes.append(ProcessSpec(name=name, command=argv, cwd=cwd, env=dict(env)))
     return tuple(processes)
+
+
+def _canonical_host(host: str) -> str:
+    """``localhost`` and ``127.0.0.1`` are the same address; ``::1`` is its own."""
+    return "127.0.0.1" if host.lower() == "localhost" else host
+
+
+def _endpoint(host: str, port: int) -> tuple[str, int]:
+    return (_canonical_host(host), port)
+
+
+def _validate_topology(links: tuple[Link, ...], errors: list[str]) -> None:
+    """Reject link layouts that could never behave: binds, self loops, 2-cycles.
+
+    This is a cheap static check, not a graph engine.  It catches the three
+    mistakes that are easy to make by hand and confusing to debug at runtime:
+    two links fighting over one port, a link pointing at itself, and two links
+    forwarding into each other.
+    """
+    bound: dict[tuple[str, int], Link] = {}
+    for link in links:
+        listen = _endpoint(link.listen_host, link.listen_port)
+        if listen in bound:
+            errors.append(
+                f"link {link.name!r} listens on {link.listen} which link "
+                f"{bound[listen].name!r} already uses: two proxies cannot listen on "
+                "the same address"
+            )
+        else:
+            bound[listen] = link
+        if listen == _endpoint(link.upstream_host, link.upstream_port):
+            errors.append(
+                f"link {link.name!r} forwards to itself "
+                f"({link.listen} -> {link.upstream}): listen and upstream must differ"
+            )
+
+    for index, link in enumerate(links):
+        for other in links[index + 1 :]:
+            if _endpoint(link.listen_host, link.listen_port) == _endpoint(
+                other.upstream_host, other.upstream_port
+            ) and _endpoint(link.upstream_host, link.upstream_port) == _endpoint(
+                other.listen_host, other.listen_port
+            ):
+                errors.append(
+                    f"links {link.name!r} and {other.name!r} forward to each other "
+                    f"({link.listen} <-> {link.upstream}): that is a loop, not a link"
+                )
 
 
 _FAULT_FIELDS = {
@@ -778,6 +849,7 @@ def _parse_scenario(data: Any, path: str | None, base_dir: str | None) -> Scenar
         raw_assertions = []
 
     links = _parse_links(raw_links, errors)
+    _validate_topology(links, errors)
     processes = _parse_processes(raw_processes, errors, base_dir)
     faults = _parse_faults(
         raw_faults,

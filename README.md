@@ -175,9 +175,17 @@ relative to the scenario file.
 
 `edgefaultlab validate` checks all of it up front - unknown links, unknown
 processes, misspelled actions, misspelled fields, missing required fields,
-faults scheduled after the run ends - and reports every problem at once.
-EdgeFaultLab never hard codes a message schema: it decodes a JSON object and
-matches the fields *you* name.
+faults scheduled after the run ends, numbers that are not finite - and reports
+every problem at once. EdgeFaultLab never hard codes a message schema: it
+decodes a JSON object and matches the fields *you* name.
+
+The link layout is checked statically too, so a mistake shows up in `validate`
+instead of as an `Address already in use` half way through a run:
+
+* two links may not listen on the same address (`localhost` and `127.0.0.1` count
+  as the same host; `::1` is its own),
+* a link may not forward to its own listen address,
+* two links may not forward into each other (a direct two-link cycle).
 
 ## Assertions
 
@@ -203,6 +211,11 @@ them. An assertion can say where to look:
 ```
 
 Without a selector, every delivery on every link counts.
+
+`unique` is unforgiving on purpose: if a message matches the filter but does not
+carry the key, the assertion **fails**. "I could not check the `command_id`" is
+not the same answer as "I checked it, and it is unique", and only the second one
+proves idempotency.
 
 ## Quick start
 
@@ -284,6 +297,12 @@ edit `cwd` so it points at your checkout. See
 [examples/smart_agriculture/README.md](examples/smart_agriculture/README.md) for
 the port layout that lets a proxy sit in front of nodes with hard-coded ports.
 
+These files are checked into EdgeFaultLab CI with `edgefaultlab validate`, which
+proves they are well formed scenarios. Running them against the other repository
+is **not** part of EdgeFaultLab's CI: that would mean cloning and starting a
+second project on every push, and the cross-repo result belongs to that project,
+not to this one.
+
 ## Output and reports
 
 ```text
@@ -302,10 +321,13 @@ and one `ASSERTION_PASS` or `ASSERTION_FAIL` per assertion at the end.
 Message bodies are truncated at 16 KB and flagged `truncated: true`, so a run
 cannot fill the disk.
 
-**Recovery time** is the gap between a disruptive fault (`drop`, `disconnect`,
-`link_down`, `process_kill`) and the system's first sign of life afterwards -
-the first delivered message that satisfies one of the scenario's `eventually`
-assertions.
+**Recovery time** is the gap between the moment a disruptive fault *took
+effect* - `MESSAGE_DROPPED`, `LINK_DISCONNECTED`, `LINK_DOWN` or `PROCESS_KILL`,
+not merely "the fault was armed" - and the system's first sign of life
+afterwards. That sign of life is the first delivery that satisfies one of the
+scenario's `eventually` assertions, judged with the same link, direction, match
+filter and time window as that assertion. A scenario with no `eventually`
+assertion falls back to the first message delivered after the disruption.
 
 ## Determinism
 
@@ -358,6 +380,11 @@ protocol-aware framing: it copies newline-delimited lines. Process management is
 exercised on macOS and Linux (CI runs `ubuntu-latest`); the Windows path uses
 `CTRL_BREAK_EVENT` / `terminate()` and is best effort.
 
+One message may be at most 1 MiB (`MAX_MESSAGE_SIZE`). The boundary is exact: a
+line of exactly 1 MiB is delivered, 1 MiB + 1 byte is refused with
+`MESSAGE_TOO_LARGE` and the connection is closed, whether or not the oversized
+line was newline terminated.
+
 ## Not implemented
 
 Deliberately out of scope for v0.1: a web dashboard, Grafana / Prometheus,
@@ -376,7 +403,7 @@ edgefaultlab/                10 source files, standard library only
 scenarios/                   4 runnable demo scenarios + 1 template
 examples/demo_system/        the three node demo system
 examples/smart_agriculture/  5 integration scenarios for another repository
-tests/                       39 tests, including real-TCP end-to-end runs
+tests/                       49 tests, including real-TCP end-to-end runs
 ```
 
 ```bash

@@ -87,6 +87,65 @@ def test_unique_catches_a_command_that_was_executed_twice():
     assert passed and "2 distinct" in detail
 
 
+def test_unique_passes_only_when_every_match_carries_a_distinct_key():
+    spec = AssertionSpec(
+        0,
+        "unique",
+        match={"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+        key="payload.command_id",
+    )
+    passed, detail = run(spec, [])
+    assert passed and "0 distinct" in detail, "nothing to check is not a failure"
+
+    passed, _ = run(
+        spec, [observation(1.0, "CONTROL_RESULT", status="EXECUTED", command_id="cmd-1")]
+    )
+    assert passed
+
+    passed, detail = run(
+        spec,
+        [
+            observation(1.0, "CONTROL_RESULT", status="EXECUTED", command_id="cmd-1"),
+            observation(2.0, "CONTROL_RESULT", status="EXECUTED", command_id="cmd-2"),
+            observation(3.0, "CONTROL_RESULT", status="EXECUTED", command_id="cmd-3"),
+        ],
+    )
+    assert passed and "3 distinct" in detail
+
+
+def test_unique_fails_when_a_matching_message_has_no_key():
+    """Not being able to check a command_id is not the same as checking it."""
+    spec = AssertionSpec(
+        0,
+        "unique",
+        match={"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+        key="payload.command_id",
+    )
+    passed, detail = run(spec, [observation(1.0, "CONTROL_RESULT", status="EXECUTED")])
+    assert not passed
+    assert "1 matching message(s) missing key payload.command_id" in detail
+
+    passed, detail = run(
+        spec,
+        [
+            observation(1.0, "CONTROL_RESULT", status="EXECUTED", command_id="cmd-1"),
+            observation(2.0, "CONTROL_RESULT", status="EXECUTED"),
+            observation(3.0, "CONTROL_RESULT", status="EXECUTED"),
+        ],
+    )
+    assert not passed and "2 matching message(s) missing key" in detail
+
+    # Messages that do not match the filter are none of this assertion's business.
+    passed, _ = run(
+        spec,
+        [
+            observation(1.0, "CONTROL_RESULT", status="EXECUTED", command_id="cmd-1"),
+            observation(2.0, "CONTROL_RESULT", status="REJECTED"),
+        ],
+    )
+    assert passed
+
+
 def test_sequence_needs_the_steps_in_order():
     spec = AssertionSpec(
         0, "sequence", steps=({"type": "CONTROL_COMMAND"}, {"type": "ACK"})

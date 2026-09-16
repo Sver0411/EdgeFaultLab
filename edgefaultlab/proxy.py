@@ -82,8 +82,12 @@ async def read_lines(
 ) -> AsyncIterator[bytes]:
     """Yield newline terminated lines (without the newline) from ``reader``.
 
-    Raises :class:`MessageTooLarge` as soon as one line grows past ``max_size``,
-    which is what keeps a broken producer from eating all the memory.
+    The size limit is on the message itself, not on the framing: a line of
+    exactly ``max_size`` bytes is accepted, ``max_size + 1`` is not, whether or
+    not it carries a trailing newline.  A final line at EOF without a newline is
+    subject to the same rule.  Raising :class:`MessageTooLarge` as soon as the
+    buffer grows past the limit is also what keeps a broken producer from eating
+    all the memory.
     """
     buffer = bytearray()
     while True:
@@ -91,6 +95,8 @@ async def read_lines(
         if not chunk:
             if buffer:
                 # A final line without a trailing newline is still a message.
+                if len(buffer) > max_size:
+                    raise MessageTooLarge(len(buffer), max_size)
                 yield bytes(buffer)
             return
         buffer.extend(chunk)
@@ -98,6 +104,11 @@ async def read_lines(
             index = buffer.find(b"\n")
             if index < 0:
                 break
+            if index > max_size:
+                # Checked before yielding: "max_size bytes + newline" is the
+                # largest message that may pass, so the framing must not be
+                # able to smuggle a longer one through.
+                raise MessageTooLarge(index, max_size)
             line = bytes(buffer[:index])
             del buffer[: index + 1]
             yield line
@@ -226,24 +237,30 @@ class LinkProxy:
 
     # -- link level faults ------------------------------------------------
 
-    async def set_down(self, down: bool, reason: str = "link_down") -> None:
+    async def set_down(
+        self, down: bool, reason: str = "link_down", fault_id: str | None = None
+    ) -> None:
         """Make the link unusable (``link_down``) or usable again."""
         if self._down == down:
             return
         self._down = down
         if down:
             self.recorder.event(
-                "LINK_DOWN", link=self.link.name, details={"reason": reason}
+                "LINK_DOWN",
+                link=self.link.name,
+                details={"reason": reason, "fault_id": fault_id},
             )
             self._close_connections(reason)
         else:
             self.recorder.event("LINK_UP", link=self.link.name, details={"reason": reason})
 
-    async def disconnect(self, reason: str = "disconnect") -> int:
+    async def disconnect(self, reason: str = "disconnect", fault_id: str | None = None) -> int:
         """Drop the TCP connections that are currently open on this link."""
         closed = self._close_connections(reason)
         self.recorder.event(
-            "LINK_DISCONNECTED", link=self.link.name, details={"reason": reason, "connections": closed}
+            "LINK_DISCONNECTED",
+            link=self.link.name,
+            details={"reason": reason, "connections": closed, "fault_id": fault_id},
         )
         return closed
 
@@ -519,12 +536,24 @@ class LinkProxy:
 
         A window that never filled is sent on in its original order: EdgeFaultLab
         does not get to keep a message hostage just because the run ended.
+
+        Only *this* link's residue is released.  Several links can share one
+        fault engine, and a link that is shutting down must never write another
+        link's buffered messages.
         """
-        batches = self.engine.flush()
+        batches = self.engine.flush(self.link.name)
         if not batches:
             return
         for batch in batches:
-            _link_name, direction = batch.key
+            link_name, direction = batch.key
+            if link_name != self.link.name:  # pragma: no cover - defensive
+                self.report_failure(
+                    ProxyError(
+                        f"refusing to flush reorder buffer of link {link_name!r} "
+                        f"from link {self.link.name!r}"
+                    )
+                )
+                continue
             writer = self._writer_for(direction)
             for delivery, _raw in batch.items:
                 self._unbuffer(len(delivery.data))

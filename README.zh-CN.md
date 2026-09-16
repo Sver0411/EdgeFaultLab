@@ -173,6 +173,14 @@ Toxiproxy、`tc`/`netem`、包级 chaos 工具在本职工作上非常强：延�
 EdgeFaultLab **不硬编码任何消息 schema**：它只解析 JSON 对象，并匹配你写出来的
 字段。
 
+链路布局也会被静态检查，所以错误会出现在 `validate` 里，而不是跑了一半才报
+`Address already in use`：
+
+* 两条链路不能监听同一个地址（`localhost` 与 `127.0.0.1` 视为同一台主机，
+  `::1` 独立对待）；
+* 链路不能把 upstream 指向自己的 listen 地址；
+* 两条链路不能互相把对方当作 upstream（直接的双链路环）。
+
 ## 断言
 
 断言只看"真正到达链路另一侧"的消息。被丢弃的消息从未送达，因此不能满足断言；
@@ -195,6 +203,10 @@ EdgeFaultLab **不硬编码任何消息 schema**：它只解析 JSON 对象，�
 ```
 
 不写选择器时，所有链路上的每一次送达都会被计入。
+
+`unique` 故意不留情面：只要有一条消息命中了 `match`、却没有携带 `key`，该断言
+就 **FAIL**。因为"我无法检查 `command_id`"和"我查过了，它是唯一的"是两回事，
+只有后者才能证明幂等性。
 
 ## 快速开始
 
@@ -273,6 +285,11 @@ PASS
 的 checkout 路径。端口布局的思路见
 [examples/smart_agriculture/README.md](examples/smart_agriculture/README.md)。
 
+这些文件在 EdgeFaultLab CI 里会被 `edgefaultlab validate` 检查，证明它们是格式
+正确的 scenario。但**针对另一个仓库真正运行它们不属于 EdgeFaultLab 的 CI**：
+那意味着每次 push 都要克隆并启动第二个项目，而且跨仓库的结果属于那个项目，不
+属于这里。
+
 ## 输出与报告
 
 ```text
@@ -290,9 +307,11 @@ runs/<run_id>/
 断言对应的一条 `ASSERTION_PASS` / `ASSERTION_FAIL`。消息体超过 16 KB 会被截断并
 标记 `truncated: true`，一次运行不可能写满磁盘。
 
-**恢复时间（recovery time）**：从破坏性故障（`drop`、`disconnect`、`link_down`、
-`process_kill`）发生，到系统重新出现生命迹象之间的距离——也就是之后第一条满足
-某个 `eventually` 断言的消息。
+**恢复时间（recovery time）**：从破坏性故障**真正生效**的那一刻（`MESSAGE_DROPPED`、
+`LINK_DISCONNECTED`、`LINK_DOWN`、`PROCESS_KILL`，而不是"故障被武装"的时刻），
+到系统重新出现生命迹象之间的距离。这个"生命迹象"是第一条满足某个 `eventually`
+断言的送达，并且使用与该断言完全相同的 link、direction、match 过滤器和时间窗。
+一个没有 `eventually` 断言的 scenario 退化为"故障之后的第一条送达"。
 
 ## 确定性
 
@@ -336,6 +355,10 @@ EdgeFaultLab v0.1 测试的是系统的**软件可见故障语义**，它不是�
 Linux 上经过验证（CI 跑 `ubuntu-latest`）；Windows 分支使用
 `CTRL_BREAK_EVENT` / `terminate()`，属于尽力而为。
 
+单条消息最大 1 MiB（`MAX_MESSAGE_SIZE`），边界是精确的：正好 1 MiB 的行会被送达，
+1 MiB + 1 字节会被拒绝并记录 `MESSAGE_TOO_LARGE`，同时关闭该连接；无论这一行是否
+带换行符都一样。
+
 ## 没有实现的
 
 v0.1 明确不做：Web Dashboard、Grafana / Prometheus、Docker、Kubernetes、
@@ -352,7 +375,7 @@ edgefaultlab/                10 个源文件，只用标准库
 scenarios/                   4 个可运行的 demo scenario + 1 个模板
 examples/demo_system/        三节点 demo 系统
 examples/smart_agriculture/  5 个面向另一个仓库的集成 scenario
-tests/                       39 个测试，包含真正跑 TCP 的端到端测试
+tests/                       49 个测试，包含真正跑 TCP 的端到端测试
 ```
 
 ```bash

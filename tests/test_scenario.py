@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from edgefaultlab.scenario import ScenarioError, load_scenario
+from edgefaultlab.scenario import Scenario, ScenarioError, load_scenario
 from tests.conftest import ROOT, write_scenario
 
 VALID = {
@@ -101,3 +101,103 @@ def test_relative_cwd_is_resolved_against_the_scenario_directory(tmp_path):
     ]
     scenario = load_scenario(write_scenario(tmp_path, data))
     assert scenario.processes[0].cwd == os.path.normpath(str(tmp_path / ".." / "target"))
+
+
+def link(name: str, listen: str, upstream: str) -> dict:
+    return {"name": name, "listen": listen, "upstream": upstream}
+
+
+def test_non_finite_numbers_are_rejected(tmp_path):
+    """NaN and Infinity are not JSON, and no timing field may carry one."""
+    drop_fault = {"action": "drop", "link": "a_to_b", "match": {"type": "A"}, "count": 1}
+    eventually = {"assert": "eventually", "match": {"type": "A"}}
+    cases = [
+        ("duration = NaN", {"duration": float("nan")}, "finite"),
+        ("duration = Infinity", {"duration": float("inf")}, "finite"),
+        ("at = NaN", {"faults": [dict(drop_fault, at=float("nan"))]}, "finite"),
+        ("at = -Infinity", {"faults": [dict(drop_fault, at=float("-inf"))]}, "finite"),
+        (
+            "delay_ms = Infinity",
+            {"faults": [{"action": "delay", "link": "a_to_b", "delay_ms": float("inf"),
+                         "match": {"type": "A"}}]},
+            "finite",
+        ),
+        (
+            "offset_ms = -Infinity",
+            {"faults": [{"action": "timestamp_offset", "link": "a_to_b",
+                         "offset_ms": float("-inf"), "match": {"type": "A"}}]},
+            "finite",
+        ),
+        (
+            "link_down duration = NaN",
+            {"faults": [{"action": "link_down", "at": 1, "link": "a_to_b",
+                         "duration": float("nan")}]},
+            "finite",
+        ),
+        ("within = NaN", {"assertions": [dict(eventually, within=float("nan"))]}, "finite"),
+    ]
+    for label, override, needle in cases:
+        data = json.loads(json.dumps(VALID))
+        data.update(override)
+        raw = write_scenario(tmp_path, data)
+        # json.dumps writes the bare NaN / Infinity literals, which is exactly
+        # the input the validator has to refuse.
+        assert "NaN" in raw.read_text() or "Infinity" in raw.read_text()
+        with pytest.raises(ScenarioError) as excinfo:
+            load_scenario(raw)
+        assert needle in str(excinfo.value).lower(), f"{label}: {excinfo.value}"
+
+    # The same rule holds for scenarios built in Python instead of read from disk.
+    with pytest.raises(ScenarioError):
+        Scenario.from_dict(dict(VALID, duration=float("nan")))
+    with pytest.raises(ScenarioError):
+        Scenario.from_dict(dict(VALID, faults=[dict(drop_fault, at=float("inf"))]))
+
+
+def test_link_topology_is_validated(tmp_path):
+    """Duplicate binds, self loops and two-link cycles are caught before running."""
+    cases = [
+        (
+            "duplicate listen",
+            [
+                link("a", "127.0.0.1:9000", "127.0.0.1:9601"),
+                link("b", "127.0.0.1:9000", "127.0.0.1:9602"),
+            ],
+            "cannot listen on the same address",
+        ),
+        (
+            "localhost is the same host as 127.0.0.1",
+            [
+                link("a", "localhost:9000", "127.0.0.1:9601"),
+                link("b", "127.0.0.1:9000", "127.0.0.1:9602"),
+            ],
+            "cannot listen on the same address",
+        ),
+        (
+            "self loop",
+            [link("a", "127.0.0.1:9000", "localhost:9000")],
+            "forwards to itself",
+        ),
+        (
+            "direct two-link cycle",
+            [
+                link("a", "127.0.0.1:9000", "127.0.0.1:9001"),
+                link("b", "127.0.0.1:9001", "127.0.0.1:9000"),
+            ],
+            "forward to each other",
+        ),
+    ]
+    for label, links, needle in cases:
+        data = json.loads(json.dumps(VALID))
+        data["links"] = links
+        with pytest.raises(ScenarioError) as excinfo:
+            load_scenario(write_scenario(tmp_path, data))
+        assert needle in str(excinfo.value), f"{label}: {excinfo.value}"
+
+    # A chain that is not a loop still validates.
+    data = json.loads(json.dumps(VALID))
+    data["links"] = [
+        link("a", "127.0.0.1:9000", "127.0.0.1:9601"),
+        link("b", "127.0.0.1:9001", "127.0.0.1:9000"),
+    ]
+    assert len(load_scenario(write_scenario(tmp_path, data)).links) == 2

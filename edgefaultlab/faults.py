@@ -197,10 +197,17 @@ class Fault:
         buffer.clear()
         return ReorderedBatch(fault_id=self.id, key=key, items=items)
 
-    def flush(self) -> list[ReorderedBatch]:
-        """Release whatever is still buffered (called when the run stops)."""
+    def flush(self, link_name: str | None = None) -> list[ReorderedBatch]:
+        """Release whatever is still buffered (called when a link stops).
+
+        With ``link_name``, only the buffers of that link are released; every
+        other link keeps its residue untouched, because a link that is shutting
+        down has no business writing another link's messages.
+        """
         batches = []
         for key, items in self._buffers.items():
+            if link_name is not None and key[0] != link_name:
+                continue
             if items:
                 batches.append(ReorderedBatch(fault_id=self.id, key=key, items=list(items)))
             items.clear()
@@ -312,10 +319,11 @@ class FaultEngine:
         for fault in self.faults:
             fault.complete(reason)
 
-    def flush(self) -> list[ReorderedBatch]:
+    def flush(self, link_name: str | None = None) -> list[ReorderedBatch]:
+        """Release reorder buffers, optionally only those of one link."""
         batches: list[ReorderedBatch] = []
         for fault in self.message_faults():
-            batches.extend(fault.flush())
+            batches.extend(fault.flush(link_name))
         return batches
 
     @property
