@@ -1,5 +1,7 @@
 # EdgeFaultLab
 
+**English** | [简体中文](README.zh-CN.md)
+
 **Deterministic fault injection and resilience testing for distributed Edge / IoT systems.**
 
 EdgeFaultLab sits between the nodes of your system and injects *semantic* faults

@@ -1,5 +1,7 @@
 # EdgeFaultLab
 
+[English](README.md) | **简体中文**
+
 **面向分布式 Edge / IoT 系统的确定性故障注入与韧性测试工具。**
 
 EdgeFaultLab 位于系统节点之间，注入的是**语义级故障**——丢掉一条
