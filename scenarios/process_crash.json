@@ -1,0 +1,85 @@
+{
+  "_note": "Demo 4: the relay is killed at 6s and restarted at 14s. The pipeline has to come back without executing anything twice.",
+  "name": "process crash",
+  "seed": 42,
+  "duration": 26,
+
+  "links": [
+    {
+      "name": "producer_to_relay",
+      "listen": "127.0.0.1:9501",
+      "upstream": "127.0.0.1:9600"
+    },
+    {
+      "name": "relay_to_consumer",
+      "listen": "127.0.0.1:9502",
+      "upstream": "127.0.0.1:9601"
+    }
+  ],
+
+  "processes": [
+    {
+      "name": "consumer",
+      "command": ["python3", "consumer.py", "--port", "9601"],
+      "cwd": "../examples/demo_system"
+    },
+    {
+      "name": "relay",
+      "command": [
+        "python3", "relay.py",
+        "--listen", "127.0.0.1:9600",
+        "--upstream", "127.0.0.1:9502"
+      ],
+      "cwd": "../examples/demo_system"
+    },
+    {
+      "name": "producer",
+      "command": [
+        "python3", "producer.py",
+        "--connect", "127.0.0.1:9501",
+        "--interval", "3"
+      ],
+      "cwd": "../examples/demo_system"
+    }
+  ],
+
+  "faults": [
+    {
+      "id": "kill-relay",
+      "at": 6,
+      "action": "process_kill",
+      "process": "relay"
+    },
+    {
+      "id": "restart-relay",
+      "at": 14,
+      "action": "process_restart",
+      "process": "relay"
+    }
+  ],
+
+  "assertions": [
+    {
+      "assert": "eventually",
+      "after": 14,
+      "within": 12,
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "description": "the pipeline recovers after the relay is restarted"
+    },
+    {
+      "assert": "message_count",
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "min": 2,
+      "description": "commands still reach the consumer"
+    },
+    {
+      "assert": "unique",
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "key": "payload.command_id",
+      "description": "the crash did not cause a double execution"
+    }
+  ]
+}

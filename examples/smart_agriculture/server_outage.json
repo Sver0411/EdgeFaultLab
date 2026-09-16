@@ -1,0 +1,138 @@
+{
+  "_note": "Smart Agriculture Edge AI integration: the cloud server disappears for 10 seconds. The edge must keep running B -> A -> C and replay its queue when the server returns. Edit every 'cwd' to point at your checkout.",
+  "name": "smart agriculture - server outage",
+  "seed": 42,
+  "duration": 50,
+  "links": [
+    {
+      "name": "gateways_to_server",
+      "listen": "127.0.0.1:9100",
+      "upstream": "127.0.0.1:9400"
+    },
+    {
+      "name": "nodes_to_gateway_a1",
+      "listen": "127.0.0.1:9201",
+      "upstream": "127.0.0.1:9301"
+    }
+  ],
+  "processes": [
+    {
+      "name": "server",
+      "command": [
+        "python3",
+        "-m",
+        "server.server",
+        "--port",
+        "9400",
+        "--db",
+        "efl_server.db"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "gateway_a1",
+      "command": [
+        "python3",
+        "-m",
+        "gateway.gateway",
+        "--id",
+        "A1",
+        "--port",
+        "9301",
+        "--server-port",
+        "9100",
+        "--peer-port",
+        "9202",
+        "--queue-db",
+        "efl_queue_a1.db"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "gateway_a2",
+      "command": [
+        "python3",
+        "-m",
+        "gateway.gateway",
+        "--id",
+        "A2",
+        "--port",
+        "9202",
+        "--server-port",
+        "9100",
+        "--peer-port",
+        "9201",
+        "--queue-db",
+        "efl_queue_a2.db"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "sensor_b1",
+      "command": [
+        "python3",
+        "-m",
+        "sensor_node.sensor_node",
+        "--id",
+        "B1",
+        "--gateway",
+        "A1"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "controller_c1",
+      "command": [
+        "python3",
+        "-m",
+        "controller_node.controller_node",
+        "--id",
+        "C1",
+        "--gateway",
+        "A1"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    }
+  ],
+  "faults": [
+    {
+      "id": "server-down",
+      "at": 10,
+      "action": "link_down",
+      "link": "gateways_to_server",
+      "duration": 10
+    }
+  ],
+  "assertions": [
+    {
+      "assert": "message_count",
+      "match": {
+        "type": "CONTROL_RESULT",
+        "payload.status": "EXECUTED"
+      },
+      "min": 1,
+      "description": "the local control loop kept executing during the outage",
+      "link": "nodes_to_gateway_a1"
+    },
+    {
+      "assert": "eventually",
+      "after": 20,
+      "within": 25,
+      "match": {
+        "type": "SENSOR_DATA"
+      },
+      "description": "uploads resume after the server comes back",
+      "link": "gateways_to_server"
+    },
+    {
+      "assert": "unique",
+      "match": {
+        "type": "CONTROL_RESULT",
+        "payload.status": "EXECUTED"
+      },
+      "key": "payload.command_id",
+      "description": "the outage did not cause a double execution",
+      "link": "nodes_to_gateway_a1"
+    }
+  ]
+}

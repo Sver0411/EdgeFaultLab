@@ -1,0 +1,30 @@
+{
+  "_note": "Minimal template. It needs something listening on 127.0.0.1:9601; see examples/demo_system for a complete system to point it at.",
+  "name": "lost control command",
+  "seed": 42,
+  "duration": 20,
+
+  "links": [
+    {
+      "name": "gateway_to_controller",
+      "listen": "127.0.0.1:9501",
+      "upstream": "127.0.0.1:9601"
+    }
+  ],
+
+  "processes": [],
+
+  "faults": [
+    {
+      "at": 5.0,
+      "action": "drop",
+      "link": "gateway_to_controller",
+      "match": {
+        "type": "CONTROL_COMMAND"
+      },
+      "count": 1
+    }
+  ],
+
+  "assertions": []
+}

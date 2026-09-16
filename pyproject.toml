@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edgefaultlab"
+version = "0.1.0"
+description = "Deterministic fault injection and resilience testing for distributed Edge / IoT systems."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sver0411", email = "Sver0411@outlook.com" }]
+keywords = [
+    "iot",
+    "edge-computing",
+    "fault-injection",
+    "resilience-testing",
+    "chaos-testing",
+    "distributed-systems",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+edgefaultlab = "edgefaultlab.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Sver0411/EdgeFaultLab"
+Issues = "https://github.com/Sver0411/EdgeFaultLab/issues"
+
+[tool.setuptools]
+packages = ["edgefaultlab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

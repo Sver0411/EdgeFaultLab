@@ -1,0 +1,141 @@
+{
+  "_note": "Smart Agriculture Edge AI integration: the first CONTROL_COMMAND never reaches C1. The gateway has to time out on the ACK, retry, and the command must end up executed exactly once. Edit every 'cwd' to point at your checkout.",
+  "name": "smart agriculture - lost command",
+  "seed": 42,
+  "duration": 45,
+  "links": [
+    {
+      "name": "gateways_to_server",
+      "listen": "127.0.0.1:9100",
+      "upstream": "127.0.0.1:9400"
+    },
+    {
+      "name": "nodes_to_gateway_a1",
+      "listen": "127.0.0.1:9201",
+      "upstream": "127.0.0.1:9301"
+    }
+  ],
+  "processes": [
+    {
+      "name": "server",
+      "command": [
+        "python3",
+        "-m",
+        "server.server",
+        "--port",
+        "9400",
+        "--db",
+        "efl_server.db"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "gateway_a1",
+      "command": [
+        "python3",
+        "-m",
+        "gateway.gateway",
+        "--id",
+        "A1",
+        "--port",
+        "9301",
+        "--server-port",
+        "9100",
+        "--peer-port",
+        "9202",
+        "--queue-db",
+        "efl_queue_a1.db"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "gateway_a2",
+      "command": [
+        "python3",
+        "-m",
+        "gateway.gateway",
+        "--id",
+        "A2",
+        "--port",
+        "9202",
+        "--server-port",
+        "9100",
+        "--peer-port",
+        "9201",
+        "--queue-db",
+        "efl_queue_a2.db"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "sensor_b1",
+      "command": [
+        "python3",
+        "-m",
+        "sensor_node.sensor_node",
+        "--id",
+        "B1",
+        "--gateway",
+        "A1"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "controller_c1",
+      "command": [
+        "python3",
+        "-m",
+        "controller_node.controller_node",
+        "--id",
+        "C1",
+        "--gateway",
+        "A1"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    }
+  ],
+  "faults": [
+    {
+      "id": "drop-first-command",
+      "at": 0,
+      "action": "drop",
+      "link": "nodes_to_gateway_a1",
+      "match": {
+        "type": "CONTROL_COMMAND"
+      },
+      "count": 1
+    }
+  ],
+  "assertions": [
+    {
+      "assert": "eventually",
+      "after": 0,
+      "within": 30,
+      "match": {
+        "type": "CONTROL_RESULT",
+        "payload.status": "EXECUTED"
+      },
+      "description": "the command is executed after the ACK timeout and retry",
+      "link": "nodes_to_gateway_a1"
+    },
+    {
+      "assert": "unique",
+      "match": {
+        "type": "CONTROL_RESULT",
+        "payload.status": "EXECUTED"
+      },
+      "key": "payload.command_id",
+      "description": "the retry executed the command exactly once",
+      "link": "nodes_to_gateway_a1"
+    },
+    {
+      "assert": "message_count",
+      "match": {
+        "type": "CONTROL_COMMAND"
+      },
+      "min": 1,
+      "description": "at least one command was sent",
+      "link": "nodes_to_gateway_a1"
+    }
+  ]
+}

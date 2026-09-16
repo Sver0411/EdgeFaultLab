@@ -1,0 +1,83 @@
+{
+  "_note": "Demo 2: the first CONTROL_COMMAND is delivered twice with the same message_id and command_id. The consumer must execute it once.",
+  "name": "duplicate command",
+  "seed": 42,
+  "duration": 20,
+
+  "links": [
+    {
+      "name": "producer_to_relay",
+      "listen": "127.0.0.1:9501",
+      "upstream": "127.0.0.1:9600"
+    },
+    {
+      "name": "relay_to_consumer",
+      "listen": "127.0.0.1:9502",
+      "upstream": "127.0.0.1:9601"
+    }
+  ],
+
+  "processes": [
+    {
+      "name": "consumer",
+      "command": ["python3", "consumer.py", "--port", "9601"],
+      "cwd": "../examples/demo_system"
+    },
+    {
+      "name": "relay",
+      "command": [
+        "python3", "relay.py",
+        "--listen", "127.0.0.1:9600",
+        "--upstream", "127.0.0.1:9502"
+      ],
+      "cwd": "../examples/demo_system"
+    },
+    {
+      "name": "producer",
+      "command": [
+        "python3", "producer.py",
+        "--connect", "127.0.0.1:9501",
+        "--interval", "3"
+      ],
+      "cwd": "../examples/demo_system"
+    }
+  ],
+
+  "faults": [
+    {
+      "id": "duplicate-first-command",
+      "at": 0,
+      "action": "duplicate",
+      "link": "relay_to_consumer",
+      "match": {
+        "type": "CONTROL_COMMAND"
+      },
+      "copies": 1,
+      "count": 1
+    }
+  ],
+
+  "assertions": [
+    {
+      "assert": "unique",
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "key": "payload.command_id",
+      "description": "the duplicated command is executed exactly once"
+    },
+    {
+      "assert": "message_count",
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.reason": "DUPLICATE"},
+      "min": 1,
+      "description": "the second copy was recognised as a duplicate"
+    },
+    {
+      "assert": "message_count",
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "min": 1,
+      "description": "the command still ran"
+    }
+  ]
+}

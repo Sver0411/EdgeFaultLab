@@ -1,0 +1,83 @@
+{
+  "_note": "Demo 1: the first CONTROL_COMMAND is dropped between the relay and the consumer. The producer retries with the same command_id, and that retry must be executed - once.",
+  "name": "drop message",
+  "seed": 42,
+  "duration": 20,
+
+  "links": [
+    {
+      "name": "producer_to_relay",
+      "listen": "127.0.0.1:9501",
+      "upstream": "127.0.0.1:9600"
+    },
+    {
+      "name": "relay_to_consumer",
+      "listen": "127.0.0.1:9502",
+      "upstream": "127.0.0.1:9601"
+    }
+  ],
+
+  "processes": [
+    {
+      "name": "consumer",
+      "command": ["python3", "consumer.py", "--port", "9601"],
+      "cwd": "../examples/demo_system"
+    },
+    {
+      "name": "relay",
+      "command": [
+        "python3", "relay.py",
+        "--listen", "127.0.0.1:9600",
+        "--upstream", "127.0.0.1:9502"
+      ],
+      "cwd": "../examples/demo_system"
+    },
+    {
+      "name": "producer",
+      "command": [
+        "python3", "producer.py",
+        "--connect", "127.0.0.1:9501",
+        "--interval", "3"
+      ],
+      "cwd": "../examples/demo_system"
+    }
+  ],
+
+  "faults": [
+    {
+      "id": "drop-first-command",
+      "at": 0,
+      "action": "drop",
+      "link": "relay_to_consumer",
+      "match": {
+        "type": "CONTROL_COMMAND"
+      },
+      "count": 1
+    }
+  ],
+
+  "assertions": [
+    {
+      "assert": "eventually",
+      "after": 0,
+      "within": 15,
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "description": "dropped command is eventually delivered and executed"
+    },
+    {
+      "assert": "unique",
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "key": "payload.command_id",
+      "description": "no command_id is executed twice"
+    },
+    {
+      "assert": "message_count",
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "min": 2,
+      "description": "the system keeps working after the drop"
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "_note": "Demo 3: the first CONTROL_RESULT is held back by 2.5s. Delivery is late, but the run is not allowed to lose it.",
+  "name": "delay result",
+  "seed": 42,
+  "duration": 20,
+
+  "links": [
+    {
+      "name": "producer_to_relay",
+      "listen": "127.0.0.1:9501",
+      "upstream": "127.0.0.1:9600"
+    },
+    {
+      "name": "relay_to_consumer",
+      "listen": "127.0.0.1:9502",
+      "upstream": "127.0.0.1:9601"
+    }
+  ],
+
+  "processes": [
+    {
+      "name": "consumer",
+      "command": ["python3", "consumer.py", "--port", "9601"],
+      "cwd": "../examples/demo_system"
+    },
+    {
+      "name": "relay",
+      "command": [
+        "python3", "relay.py",
+        "--listen", "127.0.0.1:9600",
+        "--upstream", "127.0.0.1:9502"
+      ],
+      "cwd": "../examples/demo_system"
+    },
+    {
+      "name": "producer",
+      "command": [
+        "python3", "producer.py",
+        "--connect", "127.0.0.1:9501",
+        "--interval", "3"
+      ],
+      "cwd": "../examples/demo_system"
+    }
+  ],
+
+  "faults": [
+    {
+      "id": "delay-first-result",
+      "at": 0,
+      "action": "delay",
+      "link": "relay_to_consumer",
+      "match": {
+        "type": "CONTROL_RESULT"
+      },
+      "delay_ms": 2500,
+      "count": 1
+    }
+  ],
+
+  "assertions": [
+    {
+      "assert": "eventually",
+      "after": 0,
+      "within": 15,
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "description": "the delayed result still arrives"
+    },
+    {
+      "assert": "sequence",
+      "link": "relay_to_consumer",
+      "steps": [
+        {"type": "CONTROL_COMMAND"},
+        {"type": "ACK"},
+        {"type": "CONTROL_RESULT"}
+      ],
+      "description": "command, acknowledgement and result keep their order"
+    },
+    {
+      "assert": "unique",
+      "link": "producer_to_relay",
+      "match": {"type": "CONTROL_RESULT", "payload.status": "EXECUTED"},
+      "key": "payload.command_id",
+      "description": "the late result did not cause a second execution"
+    }
+  ]
+}

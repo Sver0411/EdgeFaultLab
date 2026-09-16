@@ -1,0 +1,145 @@
+{
+  "_note": "Smart Agriculture Edge AI integration: kill gateway A1 at 10s. B1 and C1 fall back to A2; the mesh must keep reporting and must not execute anything twice. Edit every 'cwd' to point at your checkout - see README.md in this directory.",
+  "name": "smart agriculture - gateway failover",
+  "seed": 42,
+  "duration": 45,
+  "links": [
+    {
+      "name": "gateways_to_server",
+      "listen": "127.0.0.1:9100",
+      "upstream": "127.0.0.1:9400"
+    },
+    {
+      "name": "nodes_to_gateway_a1",
+      "listen": "127.0.0.1:9201",
+      "upstream": "127.0.0.1:9301"
+    }
+  ],
+  "processes": [
+    {
+      "name": "server",
+      "command": [
+        "python3",
+        "-m",
+        "server.server",
+        "--port",
+        "9400",
+        "--db",
+        "efl_server.db"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "gateway_a1",
+      "command": [
+        "python3",
+        "-m",
+        "gateway.gateway",
+        "--id",
+        "A1",
+        "--port",
+        "9301",
+        "--server-port",
+        "9100",
+        "--peer-port",
+        "9202",
+        "--queue-db",
+        "efl_queue_a1.db"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "gateway_a2",
+      "command": [
+        "python3",
+        "-m",
+        "gateway.gateway",
+        "--id",
+        "A2",
+        "--port",
+        "9202",
+        "--server-port",
+        "9100",
+        "--peer-port",
+        "9201",
+        "--queue-db",
+        "efl_queue_a2.db"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "sensor_b1",
+      "command": [
+        "python3",
+        "-m",
+        "sensor_node.sensor_node",
+        "--id",
+        "B1",
+        "--gateway",
+        "A1"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    },
+    {
+      "name": "controller_c1",
+      "command": [
+        "python3",
+        "-m",
+        "controller_node.controller_node",
+        "--id",
+        "C1",
+        "--gateway",
+        "A1"
+      ],
+      "cwd": "../../../AgriEdgeMesh/Smart-Agriculture-Edge-AI"
+    }
+  ],
+  "faults": [
+    {
+      "id": "kill-a1",
+      "at": 10,
+      "action": "process_kill",
+      "process": "gateway_a1"
+    }
+  ],
+  "assertions": [
+    {
+      "assert": "eventually",
+      "after": 10,
+      "within": 25,
+      "match": {
+        "type": "SENSOR_DATA"
+      },
+      "description": "the mesh keeps reporting to the cloud after A1 dies",
+      "link": "gateways_to_server"
+    },
+    {
+      "assert": "unique",
+      "match": {
+        "type": "CONTROL_RESULT",
+        "payload.status": "EXECUTED"
+      },
+      "key": "payload.command_id",
+      "description": "failover does not execute a command twice",
+      "link": "nodes_to_gateway_a1"
+    },
+    {
+      "assert": "never",
+      "match": {
+        "type": "CONTROL_RESULT",
+        "payload.reason": "UNSAFE_EXECUTION"
+      },
+      "description": "no unsafe execution was reported",
+      "link": "nodes_to_gateway_a1"
+    },
+    {
+      "assert": "message_count",
+      "match": {
+        "type": "SENSOR_DATA"
+      },
+      "min": 1,
+      "description": "sensor data reached the cloud at all",
+      "link": "gateways_to_server"
+    }
+  ]
+}
