@@ -131,6 +131,15 @@ Toxiproxy、`tc`/`netem`、包级 chaos 工具在本职工作上非常强：延�
 （按比例）。概率一定在该故障自己的、由 seed 派生的随机源上掷骰子，绝不使用全局
 随机状态。
 
+当多个故障命中同一条消息时，v0.1 只采用一条简单规则：**DROP 具有终止优先级**。
+被丢弃的消息不会被延迟、复制或重排，这些故障也不会被记为 applied——因此一个带
+`count: 1` 的 `delay` 仍然把唯一一次机会留给下一条命令。
+
+`timestamp_offset` 假设被修改的数值型 `timestamp` 字段以**秒**为单位，`offset_ms`
+会先转换为秒再加到 timestamp 上：`offset_ms: -30000` 表示减去 30 秒。如果被测协议
+的 `timestamp` 是 Unix 毫秒，v0.1 的 `timestamp_offset` 无法表达正确语义——这里
+故意不提供单位选项。
+
 ## Scenario 文件
 
 用 JSON，因为它不带来依赖，而且任何语言都能生成。以 `_` 开头的键视为注释；
@@ -377,7 +386,7 @@ edgefaultlab/                10 个源文件，只用标准库
 scenarios/                   4 个可运行的 demo scenario + 1 个模板
 examples/demo_system/        三节点 demo 系统
 examples/smart_agriculture/  5 个面向另一个仓库的集成 scenario
-tests/                       49 个测试，包含真正跑 TCP 的端到端测试
+tests/                       56 个测试，包含真正跑 TCP 的端到端测试
 ```
 
 ```bash

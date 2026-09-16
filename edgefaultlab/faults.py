@@ -29,14 +29,35 @@ __all__ = ["Fault", "FaultEngine", "MessagePlan", "ReorderedBatch"]
 
 @dataclass
 class MessagePlan:
-    """What the proxy should do with one received message."""
+    """What the proxy should do with one received message.
 
+    ``FaultEngine.plan()`` only *decides*.  Actions that take effect later -
+    delaying, duplicating, buffering for reorder - are marked applied by the
+    proxy at the moment they really happen (``FaultEngine.note_applied``), so a
+    fault that never got to act never claims that it did.
+
+    The fault that caused each action is named explicitly instead of being
+    guessed from the end of a list: with several faults matching one message,
+    the last entry says nothing about which one caused which action.
+    """
+
+    #: Every fault whose ``match`` matched this message, in scenario order.
     fault_ids: list[str] = field(default_factory=list)
+
     dropped: bool = False
-    dropped_by: str | None = None
+    drop_fault_id: str | None = None
+
     delay_ms: float = 0.0
+    delay_fault_id: str | None = None
+    delay_fault_ids: list[str] = field(default_factory=list)
+
     copies: int = 0
+    duplicate_fault_id: str | None = None
+    duplicate_fault_ids: list[str] = field(default_factory=list)
+
     mutated: bool = False
+    timestamp_fault_ids: list[str] = field(default_factory=list)
+
     reorder: Fault | None = None
     reorder_window: int = 0
 
@@ -224,6 +245,7 @@ class FaultEngine:
     def __init__(self, faults: tuple[FaultSpec, ...], recorder: EventRecorder, seed: int):
         self.recorder = recorder
         self.faults = [Fault(spec, recorder, seed) for spec in faults]
+        self._by_id = {fault.id: fault for fault in self.faults}
 
     def start(self) -> None:
         for fault in self.faults:
@@ -234,6 +256,18 @@ class FaultEngine:
 
     def message_faults(self) -> list[Fault]:
         return [fault for fault in self.faults if fault.is_message_action]
+
+    def note_applied(self, fault_id: str | None, *, link: str | None = None, reason: str = "") -> None:
+        """Record that an action really took effect on a message.
+
+        Called by the proxy once the delivery, the duplicate copy or the reorder
+        buffering actually happened - never while a plan is still only a plan.
+        """
+        if fault_id is None:
+            return
+        fault = self._by_id.get(fault_id)
+        if fault is not None:
+            fault.note_applied(link, reason)
 
     def activate_due(self, now: float) -> None:
         """Activate faults whose ``at`` has passed but whose timer has not fired."""
@@ -248,9 +282,15 @@ class FaultEngine:
         link: str | None,
         direction: str | None,
     ) -> MessagePlan:
-        """Decide what happens to one decoded message on one link."""
+        """Decide what happens to one decoded message on one link.
+
+        Composition rule for v0.1, deliberately simple: **drop has terminal
+        priority**.  A message that is dropped reaches nothing, so no other
+        action is applied to it and none of the other faults burns a ``count``.
+        """
         self.activate_due(self.recorder.now())
         plan = MessagePlan()
+        best_copies = 0
         for fault in self.message_faults():
             if not fault.is_active:
                 continue
@@ -272,22 +312,33 @@ class FaultEngine:
 
             if action == "drop":
                 plan.dropped = True
-                plan.dropped_by = fault.id
+                plan.drop_fault_id = fault.id
+                # Decided here and now: this message will not be forwarded.
                 fault.note_applied(link)
                 break  # a dropped message reaches nothing else
             if action == "delay":
-                plan.delay_ms = max(plan.delay_ms, fault.spec.delay_ms)
-                fault.note_applied(link)
+                plan.delay_fault_ids.append(fault.id)
+                if fault.spec.delay_ms > plan.delay_ms:
+                    plan.delay_ms = fault.spec.delay_ms
+                    plan.delay_fault_id = fault.id  # the fault that sets the final delay
             elif action == "duplicate":
                 plan.copies += fault.spec.copies
-                fault.note_applied(link)
+                plan.duplicate_fault_ids.append(fault.id)
+                if fault.spec.copies > best_copies:
+                    best_copies = fault.spec.copies
+                    plan.duplicate_fault_id = fault.id  # the largest contributor
             elif action == "reorder":
-                plan.reorder = fault
-                plan.reorder_window = fault.spec.reorder_window
+                if plan.reorder is None:
+                    # One window per message: a second reorder fault cannot
+                    # buffer something that is already in another window, and
+                    # is therefore matched but never applied.
+                    plan.reorder = fault
+                    plan.reorder_window = fault.spec.reorder_window
             elif action == "timestamp_offset":
                 ok, before, after = fault.mutate(message)
                 if ok:
                     plan.mutated = True
+                    plan.timestamp_fault_ids.append(fault.id)
                     self.recorder.event(
                         "MESSAGE_MUTATED",
                         link=link,
@@ -301,6 +352,7 @@ class FaultEngine:
                             "offset_ms": fault.spec.offset_ms,
                         },
                     )
+                    # The message itself was changed, so this one really happened.
                     fault.note_applied(link)
                 else:
                     self.recorder.event(

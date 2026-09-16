@@ -217,6 +217,11 @@ def find_disruptions(
             details = record.get("details", {})
             if details.get("fault_id") != fault_id:
                 continue
+            if event == "LINK_DISCONNECTED" and not details.get("connections"):
+                # A disconnect that found no open connection broke nothing; it
+                # stays in the trace for audit, but it is not a disruption and
+                # must not start a recovery clock.
+                continue
             disruptions.append(
                 {
                     "fault": fault_id,

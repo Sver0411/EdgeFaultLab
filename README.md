@@ -135,6 +135,17 @@ Faults are matched per message and may carry a `count` (apply to the first N
 matches) or a `probability` (apply to a fraction of them). A probability is
 always rolled on the fault's own seeded random generator, never on global state.
 
+When several faults match the same message, v0.1 uses one simple rule: **drop
+has terminal priority**. A message that gets dropped is never delayed,
+duplicated or reordered, and those faults are not counted as applied - so a
+`delay` with `count: 1` still has its one shot left for the next command.
+
+`timestamp_offset` assumes the matched numeric `timestamp` field is expressed in
+**seconds**, and converts `offset_ms` to seconds before adding it: `offset_ms:
+-30000` subtracts 30 seconds. A protocol that keeps `timestamp` in Unix
+milliseconds cannot express its semantics with `timestamp_offset` in v0.1; there
+is no unit option, on purpose.
+
 ## Scenario format
 
 JSON, because it costs no dependency and every language can emit it. Keys
@@ -405,7 +416,7 @@ edgefaultlab/                10 source files, standard library only
 scenarios/                   4 runnable demo scenarios + 1 template
 examples/demo_system/        the three node demo system
 examples/smart_agriculture/  5 integration scenarios for another repository
-tests/                       49 tests, including real-TCP end-to-end runs
+tests/                       56 tests, including real-TCP end-to-end runs
 ```
 
 ```bash

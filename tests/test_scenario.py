@@ -201,3 +201,87 @@ def test_link_topology_is_validated(tmp_path):
         link("b", "127.0.0.1:9001", "127.0.0.1:9000"),
     ]
     assert len(load_scenario(write_scenario(tmp_path, data)).links) == 2
+
+
+def test_duplicate_fault_ids_are_rejected(tmp_path):
+    """The fault id is the key events, recovery and reports are joined on."""
+    cases = [
+        (
+            "same id, same action",
+            [
+                {"id": "break-a", "action": "drop", "link": "a_to_b",
+                 "match": {"type": "A"}, "count": 1},
+                {"id": "break-a", "action": "drop", "link": "a_to_b",
+                 "match": {"type": "B"}, "count": 1},
+            ],
+        ),
+        (
+            "same id, different action",
+            [
+                {"id": "break-a", "action": "drop", "link": "a_to_b",
+                 "match": {"type": "A"}, "count": 1},
+                {"id": "break-a", "action": "link_down", "at": 1, "link": "a_to_b",
+                 "duration": 1},
+            ],
+        ),
+        (
+            "explicit id clashing with a generated default",
+            [
+                {"action": "drop", "link": "a_to_b", "match": {"type": "A"}, "count": 1},
+                {"id": "drop#1", "action": "link_down", "at": 1, "link": "a_to_b",
+                 "duration": 1},
+            ],
+        ),
+    ]
+    for label, faults in cases:
+        data = json.loads(json.dumps(VALID))
+        data["faults"] = faults
+        with pytest.raises(ScenarioError) as excinfo:
+            load_scenario(write_scenario(tmp_path, data))
+        assert "duplicate fault id 'break-a'" in str(excinfo.value) or (
+            "duplicate fault id 'drop#1'" in str(excinfo.value)
+        ), f"{label}: {excinfo.value}"
+
+    # Distinct ids still validate.
+    data = json.loads(json.dumps(VALID))
+    data["faults"] = [
+        {"id": "break-a", "action": "drop", "link": "a_to_b", "match": {"type": "A"},
+         "count": 1},
+        {"id": "break-b", "action": "link_down", "at": 1, "link": "a_to_b", "duration": 1},
+    ]
+    assert len(load_scenario(write_scenario(tmp_path, data)).faults) == 2
+
+
+def test_message_count_bounds_must_be_possible(tmp_path):
+    cases = [
+        ("equals -1", {"equals": -1}, "must be >= 0"),
+        ("min -1", {"min": -1}, "must be >= 0"),
+        ("max -2", {"max": -2}, "must be >= 0"),
+        ("min > max", {"min": 10, "max": 2}, "must not be greater than"),
+        ("equals < min", {"equals": 5, "min": 10}, "contradicts 'min'"),
+        ("equals > max", {"equals": 10, "max": 5}, "contradicts 'max'"),
+    ]
+    for label, bounds, needle in cases:
+        assertion = {"assert": "message_count", "match": {"type": "A"}}
+        assertion.update(bounds)
+        data = json.loads(json.dumps(VALID))
+        data["assertions"] = [assertion]
+        with pytest.raises(ScenarioError) as excinfo:
+            load_scenario(write_scenario(tmp_path, data))
+        assert needle in str(excinfo.value), f"{label}: {excinfo.value}"
+
+    # Redundant but consistent bounds are not an error.
+    data = json.loads(json.dumps(VALID))
+    data["assertions"] = [
+        {
+            "assert": "message_count",
+            "match": {"type": "A"},
+            "equals": 5,
+            "min": 2,
+            "max": 10,
+        },
+        {"assert": "message_count", "match": {"type": "A"}, "equals": 0},
+    ]
+    scenario = load_scenario(write_scenario(tmp_path, data))
+    assert scenario.assertions[0].equals == 5
+    assert scenario.assertions[1].equals == 0

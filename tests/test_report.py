@@ -180,6 +180,38 @@ def test_recovery_uses_the_same_selector_and_window_as_the_assertion():
     assert "on link_a (forward)" in recovery[0]["recovered_by"]
 
 
+def test_a_disconnect_that_broke_nothing_is_not_a_disruption():
+    fault = make_fault(0, "disconnect", at=5.0, link="l", fault_id="cut")
+    spec = AssertionSpec(0, "eventually", match={"type": "HEARTBEAT"}, after=0, within=10)
+
+    def disconnected(recorder: EventRecorder, at: float, connections: int) -> None:
+        recorder.event(
+            "LINK_DISCONNECTED",
+            link="l",
+            at=at,
+            details={"fault_id": "cut", "connections": connections, "reason": "fault cut"},
+        )
+
+    empty = EventRecorder()
+    disconnected(empty, 5.0, 0)
+    empty.observe({"type": "HEARTBEAT"}, link="l", direction="forward", at=8.0)
+    assert find_disruptions(empty, (fault,)) == [], "nothing was disconnected"
+    assert empty.count("LINK_DISCONNECTED") == 1, "the event is still recorded for audit"
+
+    real = EventRecorder()
+    disconnected(real, 5.0, 1)
+    real.observe({"type": "HEARTBEAT"}, link="l", direction="forward", at=8.0)
+    disruptions = find_disruptions(real, (fault,))
+    assert disruptions[0]["at"] == 5.0 and disruptions[0]["event"] == "LINK_DISCONNECTED"
+    assert compute_recovery(real, disruptions, (spec,))[0]["recovery_time"] == 3.0
+
+    # A no-op disconnect must not hide a later one that really cut a connection.
+    both = EventRecorder()
+    disconnected(both, 5.0, 0)
+    disconnected(both, 6.0, 2)
+    assert find_disruptions(both, (fault,))[0]["at"] == 6.0
+
+
 def test_report_and_console_are_short_and_state_the_result():
     recorder = recorder_with_fault()
     results = [AssertionResult(0, "message_count", "commands arrive", True, "observed 1 message")]

@@ -480,6 +480,7 @@ def _parse_faults(
     process_names: set[str],
 ) -> tuple[FaultSpec, ...]:
     faults: list[FaultSpec] = []
+    seen_ids: set[str] = set()
     for index, entry in enumerate(data):
         where = f"faults[{index}]"
         if not isinstance(entry, dict):
@@ -503,6 +504,12 @@ def _parse_faults(
         if not isinstance(fault_id, str) or not fault_id:
             errors.append(f"{where}: 'id' must be a non-empty string")
             fault_id = f"{action}#{index + 1}"
+        elif fault_id in seen_ids:
+            # Events, recovery and reports all key off the fault id, so two
+            # faults may not share one.
+            errors.append(f"{where}: duplicate fault id {fault_id!r}")
+        else:
+            seen_ids.add(fault_id)
 
         at = entry.get("at", 0.0)
         if not _is_number(at) or at < 0:
@@ -716,6 +723,30 @@ def _parse_assertions(
         if maximum is not None and (not isinstance(maximum, int) or isinstance(maximum, bool)):
             errors.append(f"{where}: 'max' must be an integer")
             maximum = None
+
+        # A message count is a count: negative, and self-contradicting, bounds
+        # describe an assertion that no run could ever satisfy.
+        for name, value in (("equals", equals), ("min", minimum), ("max", maximum)):
+            if value is not None and value < 0:
+                errors.append(f"{where}: '{name}' must be >= 0, got {value}")
+                if name == "equals":
+                    equals = None
+                elif name == "min":
+                    minimum = None
+                else:
+                    maximum = None
+        if minimum is not None and maximum is not None and minimum > maximum:
+            errors.append(
+                f"{where}: 'min' ({minimum}) must not be greater than 'max' ({maximum})"
+            )
+        if equals is not None and minimum is not None and equals < minimum:
+            errors.append(
+                f"{where}: 'equals' ({equals}) contradicts 'min' ({minimum})"
+            )
+        if equals is not None and maximum is not None and equals > maximum:
+            errors.append(
+                f"{where}: 'equals' ({equals}) contradicts 'max' ({maximum})"
+            )
 
         key = entry.get("key")
         if kind == "unique":

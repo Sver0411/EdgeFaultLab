@@ -19,7 +19,7 @@ def test_drop_applies_to_the_matching_message_and_then_completes():
         [make_fault(0, "drop", link="l", match={"type": "CMD"}, count=1)], recorder
     )
     plan = fault_engine.plan({"type": "CMD", "message_id": "m1"}, link="l", direction="forward")
-    assert plan.dropped and plan.dropped_by == "drop#1"
+    assert plan.dropped and plan.drop_fault_id == "drop#1"
 
     second = fault_engine.plan({"type": "CMD", "message_id": "m2"}, link="l", direction="forward")
     assert not second.dropped, "count=1 must stop after the first match"

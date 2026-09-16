@@ -123,9 +123,14 @@ class _Delivery:
     message: Any
     data: bytes
     delay_ms: float = 0.0
+    delay_fault_id: str | None = None
     copies: int = 0
+    duplicate_fault_id: str | None = None
     fault_ids: list[str] = field(default_factory=list)
     from_reorder: bool = False
+    #: Actions already reported to the fault engine for this message, so a
+    #: reorder flush or a second copy cannot count the same action twice.
+    noted: set[str] = field(default_factory=set)
 
 
 class _Connection:
@@ -465,7 +470,9 @@ class LinkProxy:
             message=decoded,
             data=data,
             delay_ms=plan.delay_ms,
+            delay_fault_id=plan.delay_fault_id,
             copies=plan.copies,
+            duplicate_fault_id=plan.duplicate_fault_id,
             fault_ids=list(plan.fault_ids),
         )
 
@@ -475,7 +482,7 @@ class LinkProxy:
                 link=self.link.name,
                 direction=direction,
                 message=decoded,
-                details={"fault_id": plan.dropped_by},
+                details={"fault_id": plan.drop_fault_id, "faults": list(plan.fault_ids)},
             )
             return
 
@@ -485,14 +492,18 @@ class LinkProxy:
                 link=self.link.name,
                 direction=direction,
                 message=decoded,
-                details={"fault_id": plan.fault_ids[-1] if plan.fault_ids else None,
-                         "copies": plan.copies,
-                         "total": plan.copies + 1},
+                details={
+                    "fault_id": plan.duplicate_fault_id,
+                    "faults": list(plan.duplicate_fault_ids),
+                    "copies": plan.copies,
+                    "total": plan.copies + 1,
+                },
             )
 
         if plan.reorder is not None:
             self._buffer(delivery)
             batch = plan.reorder.buffer((self.link.name, direction), (delivery, data))
+            self._note_applied(delivery, plan.reorder.id, "buffered for reorder")
             self.recorder.event(
                 "MESSAGE_REORDER_BUFFERED",
                 link=self.link.name,
@@ -511,9 +522,20 @@ class LinkProxy:
                 link=self.link.name,
                 direction=direction,
                 message=decoded,
-                details={"delay_ms": plan.delay_ms, "fault_id": plan.fault_ids[-1] if plan.fault_ids else None},
+                details={
+                    "delay_ms": plan.delay_ms,
+                    "fault_id": plan.delay_fault_id,
+                    "faults": list(plan.delay_fault_ids),
+                },
             )
         await self._deliver(connection, writer, delivery, direction)
+
+    def _note_applied(self, delivery: _Delivery, fault_id: str | None, reason: str) -> None:
+        """Tell the fault engine an action really happened, once per message."""
+        if fault_id is None or fault_id in delivery.noted:
+            return
+        delivery.noted.add(fault_id)
+        self.engine.note_applied(fault_id, link=self.link.name, reason=reason)
 
     async def _release(
         self, batch: ReorderedBatch, writer: asyncio.StreamWriter, direction: str
@@ -598,6 +620,7 @@ class LinkProxy:
     ) -> None:
         if delivery.delay_ms > 0:
             self._buffer(delivery)
+            self._note_applied(delivery, delivery.delay_fault_id, "delayed")
             task = asyncio.create_task(
                 self._delayed_send(writer, delivery, direction, delivery.delay_ms / 1000.0)
             )
@@ -651,6 +674,10 @@ class LinkProxy:
                     connection.close("forwarding peer is gone")
                 return
             self.messages_forwarded += 1
+            if copy_index:
+                # The extra copy really went out on the wire: only now did the
+                # duplicate fault act.
+                self._note_applied(delivery, delivery.duplicate_fault_id, "duplicated")
             self.recorder.event(
                 "MESSAGE_FORWARDED",
                 link=self.link.name,
